@@ -20,6 +20,8 @@ import (
 	"fmt"
 
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/versioncheck"
 
@@ -27,6 +29,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
+
+var log = logging.DefaultLogger.WithField(logfields.LogSubsys, "k8s")
 
 // ServerCapabilities is a list of server capabilities derived based on version
 type ServerCapabilities struct {
@@ -133,18 +137,31 @@ func Force(version string) error {
 // Update retrieves the version of the Kubernetes apiserver and derives the
 // capabilities. This function must be called after connectivity to the
 // apiserver has been established.
+//
+// Discovery of capabilities only works if the disocovery API of the apiserver
+// is functionality. If it is not functional, a warning will be logged.
 func Update(client kubernetes.Interface) error {
 	sv, err := client.Discovery().ServerVersion()
 	if err != nil {
 		return err
 	}
 
+	// Discovery of API groups requires the API services of the apiserver
+	// to be healthy. Such API services can depend on the readiness of
+	// regular pods which require Cilium to function correctly. By treating
+	// failure to discover API groups as fatal, a critial loop can be
+	// entered in which Cilium cannot start because the API groups can't be
+	// discovered and th API groups will only become discoverable once
+	// Cilium is up.
 	apiGroups, apiResourceLists, err := client.Discovery().ServerGroupsAndResources()
 	if err != nil {
-		return err
+		// It doesn't make sense to retry the retrieval of this
+		// information at a later point because the capabilities are
+		// primiarly used while the agent is starting up.
+		log.WithError(err).Warning("Unable to discover API groups and resources")
+	} else {
+		updateServerGroupsAndResources(apiGroups, apiResourceLists)
 	}
-
-	updateServerGroupsAndResources(apiGroups, apiResourceLists)
 
 	// Try GitVersion first. In case of error fallback to MajorMinor
 	if sv.GitVersion != "" {
